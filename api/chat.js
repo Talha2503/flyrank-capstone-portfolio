@@ -1,8 +1,28 @@
-const Anthropic = require('@anthropic-ai/sdk');
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const RATE_LIMIT_MAX_REQUESTS = 15; // per IP, per window
+const requestLog = new Map(); // ip -> [timestamps]
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+function isRateLimited(ip) {
+  const now = Date.now();
+  const timestamps = (requestLog.get(ip) || []).filter(
+    (t) => now - t < RATE_LIMIT_WINDOW_MS
+  );
+
+  if (timestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
+    requestLog.set(ip, timestamps);
+    return true;
+  }
+
+  timestamps.push(now);
+  requestLog.set(ip, timestamps);
+  return false;
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) return forwarded.split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
+}
 
 const SYSTEM_PROMPT = `You are Talha's personal agent, embedded on his portfolio website.
 You answer questions from visitors (mostly hiring managers and engineers) about
@@ -52,35 +72,6 @@ Rules:
 - Stay on topic: Talha's work, background, and engineering decisions. If asked
   something unrelated, redirect politely to what you can help with.`;
 
-// --- Rate limiting (in-memory, per warm function instance) ---
-// Not perfectly reliable across cold starts / multiple instances, but blocks
-// the common case: one visitor or bot hammering the endpoint in a burst.
-const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const RATE_LIMIT_MAX_REQUESTS = 15; // per IP, per window
-const requestLog = new Map(); // ip -> [timestamps]
-
-function isRateLimited(ip) {
-  const now = Date.now();
-  const timestamps = (requestLog.get(ip) || []).filter(
-    (t) => now - t < RATE_LIMIT_WINDOW_MS
-  );
-
-  if (timestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
-    requestLog.set(ip, timestamps);
-    return true;
-  }
-
-  timestamps.push(now);
-  requestLog.set(ip, timestamps);
-  return false;
-}
-
-function getClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) return forwarded.split(',')[0].trim();
-  return req.socket?.remoteAddress || 'unknown';
-}
-
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
@@ -108,21 +99,35 @@ module.exports = async (req, res) => {
   }
 
   try {
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 300,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: question }],
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 300,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: question },
+        ],
+      }),
     });
 
-    const answer = message.content
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n');
+    if (!groqRes.ok) {
+      const errBody = await groqRes.text();
+      console.error('Groq API error:', groqRes.status, errBody);
+      res.status(500).json({ error: 'The agent had trouble responding. Try again shortly.' });
+      return;
+    }
+
+    const data = await groqRes.json();
+    const answer = data.choices?.[0]?.message?.content || '';
 
     res.status(200).json({ answer });
   } catch (err) {
-    console.error('Anthropic API error:', err);
+    console.error('Groq API error:', err);
     res.status(500).json({ error: 'The agent had trouble responding. Try again shortly.' });
   }
 };
